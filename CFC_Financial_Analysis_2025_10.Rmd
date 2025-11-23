@@ -1,0 +1,1012 @@
+---
+title: "CFC Financial Analysis"
+author: "Don A. Lloyd"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+---
+
+<!-- [Worksheet calculation checks](#wsck) -->
+
+[Plan v. Actual](#planvact) variances for the month
+
+[Year-to-date](#ytd) (YTD) variances
+
+[End-of-Year projections](#eoy)
+
+[Restricted funds](#rfexp) expended, [new grants and reimbursements](#newrf)
+
+[Metrics](#metrics)
+
+[Year-over-Year changes](#yoy)
+
+[Report change log](#chglog)
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# knitr::opts_knit$set(root.dir = '~/Dropbox/CFC/Finance')
+require(here)
+require(zoo)
+require(readr)
+require(readxl)
+require(dplyr)
+require(tidyr)
+require(tibble) # rownames_to_column
+require(stringr)
+require(lubridate)
+require(pdftools)
+require(ggplot2)
+require(viridis)
+require(magrittr) # set_names
+require(kableExtra) # kbl
+# require(flextable)
+require(ggspark)
+
+# local bank statement processing
+source("parse_bank_statement.R")
+
+# local funcs
+not_all_na <- function(x) any(!is.na(x))
+```
+
+### Settings
+
+```{r parameters, include=TRUE}
+FN_RDATA = "Last_save.Rdata"
+REPLACE_CFC_DATA = FALSE
+VARIANCE_LIMIT = 125 # dollar discrepancy threshold per month
+YOY_PERC_TOL = 10
+TODAY = today()
+CURRENT_MONTH = as.yearmon(TODAY)
+# can assign AS_OF in YYYY-MM format for retrospective analysis
+# otherwise it will be assigned as most recent later on in
+# set_as_of_date
+# AS_OF = as.yearmon("2023-06")
+BYPASS_BANK_STMT = FALSE
+```
+
+```{r test_data_archives, include=FALSE}
+################################
+#                              #
+#  TEST PREVIOUSLY SAVED DATA  #
+#                              #
+################################
+# 1. get current list of zips and their as of dates
+# 2. load previously saved data if it exists
+#    and identify zips not already part of the save
+# 3. process just the missing zip files
+# 4. append the newly processed data and 
+# 5. save the updated data with a backup of previous version
+cat(sprintf("scanning zip files for new data\n"))
+test_zips <- list.files(pattern = "zip$", recursive = TRUE)
+
+cffn <- lapply(test_zips, function(x) {
+  zipc <- unzip(x, list = TRUE)
+  # extract first tab of excel worksheets for restricted funds and cashflow
+  f.cf <- grep("cashflow.*.xlsx$", zipc$Name, ignore.case = TRUE, value = TRUE)
+}) %>%
+  unlist
+all_zips <- tibble(zipfn = test_zips, cffn) %>%
+  mutate(str.yr = gsub("(^[0-9]+) .*", "\\1", cffn),
+         str.mo = gsub("^.*Cashflow Budget[_ ]", "", gsub(".xlsx$", "", cffn)),
+         str.mo.1 = gsub("[_ 0-9]*", "", str.mo),
+         # if the name is in the more recent format (ca July 2025)
+         # the previous assignment will produce an empty string ""
+         str.mo.2 = ifelse(str.mo.1 == "", month.name[as.numeric(substr(str.mo, 1, 2))], str.mo.1),
+         str.mo.f = ifelse(str.mo.2 == "Sept", "September", str.mo.2),
+         ym = as.yearmon(paste(str.mo.f, str.yr), format=("%b %Y"))
+  ) %>%
+  select(-starts_with("str"), -cffn)
+tail(all_zips)
+```
+
+```{r read_archives, include=FALSE}
+if (file.exists(FN_RDATA)) {
+  cat(sprintf("loading previously archived finance data\n"))
+  load(FN_RDATA)
+  # if (exists("zips")) 
+  missing_zips <- setdiff(all_zips, zips)
+  # else {
+  #   # archived data was found but zips not found(!)
+  #   missing_zips <- all_zips
+  #   REPLACE_CFC_DATA <- TRUE
+  # }
+} else {
+  # we didn't find any saved finance data, start from scratch
+  missing_zips <- all_zips
+  REPLACE_CFC_DATA <- TRUE
+}
+```
+
+```{r get_new_cfcdata, include=FALSE}
+if (nrow(missing_zips >0)) {
+  
+  cat("reading new or missing finance data\n")
+  tmpdir <- Sys.getenv("TMPDIR")
+  unlink(paste0(tmpdir, "*.*"))
+  
+  new_zips <- pull(missing_zips, zipfn)
+  # read fresh CFC cashflow and restricted funds data
+  tmp <- lapply(new_zips, function(x) {
+    zipc <- unzip(x, list = TRUE)
+    # extract first tab of excel worksheets for restricted funds and cashflow
+    f.rf <- grep("restricted.*xlsx$", zipc$Name, ignore.case = TRUE, value = TRUE)
+    f.cf <- grep("cashflow.*.xlsx$", zipc$Name, ignore.case = TRUE, value = TRUE)
+    unzip(x, files = c(f.rf, f.cf), exdir = tmpdir)
+    f.bank <- grep("statement.*.pdf$", zipc$Name, ignore.case = TRUE, value = TRUE)
+    if (length(f.bank) >0 & !BYPASS_BANK_STMT) {
+      unzip(x, files = f.bank, exdir = tmpdir)
+    }
+    rf <- suppressMessages(read_excel(paste0(tmpdir, f.rf)))
+    cf <- suppressMessages(read_excel(paste0(tmpdir, f.cf)))
+    plan <- try(suppressMessages(read_excel(paste0(tmpdir, f.cf), sheet = 2)))
+    # use the cashflow filename to assign yearmo
+    # until July 2025, the month name appeared in text at
+    # end of cashflow filename. Format changed in July 2025
+    # to show actual file change date in mmddyy format...
+    str.year <- gsub("(^[0-9]+) .*", "\\1", f.cf)
+    str.mo <- gsub("^.*Cashflow Budget[_ ]", "", gsub(".xlsx$", "", f.cf))
+    # 20250819 edited again to better handle the mix of date formats
+    #          and the date offset introduced when the full cf replaced
+    #          the old board cf as of June 2025 financials
+    # str.test works with the "old" month Mmmmmm_YYYY (20250819)
+    str.test <- str.mo
+    if (!grepl(str.year, str.mo)) str.test <- paste(str.mo, str.year)
+    str.test <- gsub("Sept ", "Sep", str.test) # Sept won't parse correctly
+    # test on str.test but fallback to str.mo for new format (20250819)
+    # this tests successive naming formats, keeping the one that works :)
+    ym <- as.yearmon(str.test, "%B_%Y")
+    if (is.na(ym)) ym <- as.yearmon(str.test, "%B %Y")
+    if (is.na(ym)) ym <- as.yearmon(str.test, "%b %Y")
+    if (is.na(ym)) ym <- as.yearmon(str.mo, "%m%d%y")
+    # hard date test to handle new date offsett (20250819)
+    if (ym >= as.yearmon("2025-07")) ym <- ym -1/12 # sigh
+    # now move on from date processing...
+    # process the bank statement
+    bank <- NULL
+    if (length(f.bank) >0 & !BYPASS_BANK_STMT) { 
+      bank <- try( parse_bank_statement(paste0(tmpdir, f.bank)) )
+    }
+    # stop()
+    # now extract the pdfs
+    pdfs.all <- grep("pdf$", zipc$Name, ignore.case = TRUE, value = TRUE)
+    pdfs <- grep("^BS|^P&L", pdfs.all, value = TRUE)
+    unzip(x, files = pdfs, exdir = tmpdir)
+    rawtext <- lapply(paste0(tmpdir, pdfs), function(x) pdf_text(x) %>%
+                        str_split("\n"))
+    ii <- grep("BS", pdfs) # find BS, the other will be P&L
+    singlepage <- lapply(rawtext, function(x) Reduce(c, x)) # better solution
+    list(ym=ym, rf=rf, cf=cf, plan=plan, bank=bank,
+         bs=singlepage[[ii]], pl=singlepage[[3-ii]], rawpl=rawtext[[3-ii]])
+  }) # close `tmp` loop
+
+  # isolate run of dates, order data chronologically and assign names
+  l.dates0 <- as.yearmon(unlist(lapply(tmp, function(x) x$ym)))
+  names(tmp) <- l.dates0
+  rdo <- order(l.dates0) # had to delay this fix, codes are already sensitive to order
+  new_cfcdata <- lapply(rdo, function(i) tmp[[i]])
+  names(new_cfcdata) <- l.dates <- l.dates0[rdo]
+
+  local_cfcdata <<- new_cfcdata
+
+  new_cf.accts <- lapply(seq_along(new_cfcdata), function(i) {
+    tmp <- new_cfcdata[[i]][["cf"]] %>%
+      rename_at(1, ~ "Category") %>%
+      rename_at(4, ~ "Account") %>% # 20220122 to filter on Acct Codes
+      rename_all(~ sub("Septemeber", "September", .)) %>% # persistent tyypo ;)
+      slice(-(1:2)) %>%
+      mutate(`Category` = ifelse(is.na(`Category`), `...3`, `Category`)) %>%
+      # ADDED 10/29/25
+      # if 3rd field is also blank, try 2nd field
+      # this handles the two special cases of 'Checking account balance'
+      # and 'Total Reserve:Ed Jones'
+      # :(
+      mutate(`Category` = ifelse(is.na(`Category`) | `Category` == "", `...2`, `Category`)) %>%
+      select(-2, -3) %>%
+      pivot_longer(cols = where(is.numeric), names_to = "Month") %>%
+      filter(!grepl("\\+", Month)) %>%
+      mutate(
+        As_of = l.dates[i]
+        ,Month = as.factor(gsub("(.*) .*", "\\1", Month))
+        ,Account = as.factor(Account)
+        ,Month.1 = as.factor(gsub("(.*) .*", "\\1", Month))
+        ,Year = ifelse(month(As_of) == "January", year(As_of)-1, year(As_of))
+        ,Month = as.yearmon(paste0(Month.1, Year), format="%B %Y")
+      ) %>%
+      select(-Month.1, -Year)
+    tmp
+  })
+  names(new_cf.accts) <- l.dates
+  
+  new_ytd.accts <- lapply(new_cf.accts, function(cf) {
+    tmp <- filter(cf, As_of == Month) %>% # filter(cf, Actuals) %>%
+      group_by(Category, Account) %>%
+      summarise(Month = max(Month), value = sum(value, na.rm = TRUE)
+                ,.groups = "keep") %>%
+      arrange(Account)
+  })
+
+  new_plan.accts <- lapply(seq_along(new_cfcdata), function(i) {
+    ok <- sum(grepl("tbl_df", class(new_cfcdata[[i]][["plan"]])))
+    if (ok >0) {
+      tmp <- new_cfcdata[[i]][["plan"]] %>%
+        # structure of sheet changed slightly, instead of columns by number
+        # we first eliminate any blank columns to set the order correctly
+        # for both formats
+        # select(1:10) %>% 
+        select(where(not_all_na)) %>%
+        rename_at(1, ~ "Category") %>%
+        rename_at(3, ~ "Account") %>% # 20220122 to filter on Acct Codes
+        rename_all(~ sub("Septemeber", "September", .)) %>% # persistent tyypo ;)
+        rename_at(4, ~ "MTD Actual") %>% # ugh
+        rename_at(5, ~ "MTD Plan") %>%
+        rename_at(6, ~ "YTD Actual") %>% 
+        rename_at(7, ~ "YTD Plan") %>% 
+        slice(-(1:2)) %>%
+        mutate(`Category` = ifelse(is.na(`Category`), `...3`, `Category`)) %>%
+        select(1:7, -2) # %>% # , -7, -8) %>%
+      # truncate table using TOTAL EXPENSE category as last row
+      ii <- grep("^TOTAL EXPENSE", tmp$Category)[1]
+      slice_head(tmp, n = ii +2) %>%
+        filter(!is.na(Category)) %>%
+        pivot_longer(cols = where(is.numeric), names_to = "Observation") %>%
+        mutate(Month = l.dates[i]
+               # strip month from observation and prepend MTD if not YTD
+               # CHECK WHICH OF THESE ARE STILL REQUIRED
+               ,Type = ifelse(grepl("YTD", Observation), "YTD", "MTD")
+               ,Actuals = grepl("Actual", Observation)
+               ,Observation = ifelse(Actuals, "actual", "plan")
+               ,Account = as.factor(Account)
+        )
+    }
+  })
+  names(new_plan.accts) <- l.dates
+  new_plan.accts <- Filter(Negate(is.null), new_plan.accts)
+  
+  #
+  # RESTRICTED FUNDS
+  #
+  new_rf.accts <- lapply(seq_along(new_cfcdata), function(i) {
+    step0 <- new_cfcdata[[i]][["rf"]]
+    #
+    new_col_names <- as.vector(unlist(slice(step0, 1)))
+    ii <- which(is.na(new_col_names))
+    new_col_names[ii] <- paste0("X", ii)
+    ii_date_received <- max(ii)
+    ii <- grep("End Bal", new_col_names)
+    new_col_names[min(ii)] <- "End Balance Prev"
+    new_col_names[max(ii)] <- "End Balance"
+    new_col_names <- gsub(" - current month", "", new_col_names)
+    #
+    step1 <- rename_with(step0, ~ new_col_names) %>%
+      slice(-1) %>%
+      rename(Check = 1) %>%
+      mutate(Reimbursable = as.logical(cumsum(grepl("Reimbursable", Check, ignore.case = TRUE)))
+             ,n = row_number()
+      ) %>%
+      rename(`Restricted Fund` = Check, Category = 2, `Date Received` = !!ii_date_received) %>%
+      fill(`Restricted Fund`) # %>%
+    cats <- step1 %>% 
+      replace_na(list(Category = "")) %>%
+      group_by(`Restricted Fund`) %>%
+      summarize(Category = paste(Category, collapse = "")) %>%
+      ungroup %>%
+      filter(Category == "") %>%
+      mutate(Cat2 = gsub(".* - (.*)$", "\\1", `Restricted Fund`)) %>%
+      mutate(Category = ifelse(`Restricted Fund` == Cat2, "UNASSIGNED", Cat2)
+             ,isduped = TRUE) %>%
+      select(-Cat2)
+    step2 <- left_join(step1, cats, by="Restricted Fund", suffix = c(".orig", ".update")) %>%
+      mutate(Category.orig = ifelse(is.na(Category.orig), Category.update, Category.orig)) %>%
+      rename(Category = Category.orig)
+    step3 <- step2 %>% 
+      filter(!is.na(Category)) %>%
+      filter(is.na(isduped) | (isduped & !is.na(`End Balance`))) %>%
+      mutate(`Date Received` = as.Date(`Date Received`, format="%Y-%m-%d")
+             ,`Final Report Due` = as.Date(`Final Report Due`, format="%Y-%m-%d")) %>%
+      mutate(across(grep("date", colnames(.)), ~ as.Date(., format="%Y-%m-%d"))) %>%
+      mutate(across(grep("Balan|Reven|Expen|reclass", colnames(.)), ~ as.numeric(.))) %>%
+      mutate(As_of = l.dates[i]) 
+    step4 <- step3 %>%
+      distinct(`Restricted Fund`, Category, `End Balance`, .keep_all = TRUE) %>%
+      filter(Category != "($300 toward salary)") %>% # odd straggler
+      filter(str_detect(`Restricted Fund`, "^dates", negate = TRUE)) %>% # another odd straggler
+      # next line repairs an odd reimbursable entry
+      mutate(`Restricted Fund` = ifelse(grepl("^amount", `Restricted Fund`), "Retained Receipts", `Restricted Fund`)) %>%
+      # straighten up restricted fund names that were parsed into new Categories
+      mutate(`Restricted Fund` = ifelse(isduped & grepl(" - ", `Restricted Fund`), gsub("(.*) - .*", "\\1", `Restricted Fund`), `Restricted Fund`)) %>%
+      select(-Category.update, -isduped) %>% # finally cleaning up from join
+      # next two lines simplify categories
+      mutate(Category = gsub("/Collab.", "", Category)
+             ,Category = gsub("Grassroots/", "", Category)) %>%
+      # filter out dollar amounts from `Restricted Fund` or Category fields
+      # this actually eliminates a line we want, so the "^amount" fix above should
+      # mean this is now unnecessary
+      mutate(bad = grepl("^[\\$0-9.]*[. ]", `Restricted Fund`) | grepl("^[\\$0-9.]*[. ]", Category)) %>%
+      filter(!bad) %>%
+      select(-bad) %>%
+      # we can also patch some minor issues in funding categories...
+      mutate(Category = sub("ISWBN", "IWBN", Category)) %>%
+      slice(-1) %>% # remove stray header line...
+      slice(-nrow(.)) # remove the total row
+    step4
+  })
+  names(new_rf.accts) <- l.dates
+  
+  #
+  # BANK STATEMENT
+  #
+  if (!BYPASS_BANK_STMT) {
+  # new_bank_checks <- lapply(seq_along(new_cfcdata), function(i) {
+  #   new_cfcdata[[i]][["bank"]]["CHK"]
+  # })
+  new_bank_checks <- lapply(new_cfcdata, function(x) x[["bank"]]["CHK"])
+  new_bank_balances <- lapply(new_cfcdata, function(x) x[["bank"]]["BAL"])
+  new_bank_withdrawals <- lapply(new_cfcdata, function(x) x[["bank"]]["WTH"])
+  new_bank_deposits <- lapply(new_cfcdata, function(x) x[["bank"]]["DEP"])
+  new_bank_summary <- lapply(new_cfcdata, function(x) x[["bank"]]["SUM"])
+  # names(new_bank_checks) <- l.dates
+  # new_bank_balances <- lapply(seq_along(new_cfcdata), function(i) {
+  #   new_cfcdata[[i]][["bank"]]["BAL"]
+  # })
+  # names(new_bank_balances) <- l.dates
+  # new_bank_withdrawals <- lapply(seq_along(new_cfcdata), function(i) {
+  #   new_cfcdata[[i]][["bank"]]["WTH"]
+  # })
+  # names(new_bank_withdrawals) <- l.dates
+  # new_bank_deposits <- lapply(seq_along(new_cfcdata), function(i) {
+  #   new_cfcdata[[i]][["bank"]]["DEP"]
+  # })
+  # names(new_bank_deposits) <- l.dates
+  # new_bank_summary <- lapply(seq_along(new_cfcdata), function(i) {
+  #   new_cfcdata[[i]][["bank"]]["SUM"]
+  # })
+  # names(new_bank_summary) <- l.dates
+  }
+
+  #
+  # PDFS
+  # 
+  new_bs <- lapply(seq_along(new_cfcdata), function(i) {
+    unlist(new_cfcdata[[i]][["bs"]]) %>%
+      tibble() %>%
+      rename(Category=1) %>%
+      mutate(Amount = gsub("(.*) [$]*([0-9\\,\\.]+)$", "\\2", Category),
+             Category = gsub("(.*) [$]*([0-9\\,\\.]+)$", "\\1", Category),
+             Amount = as.numeric(gsub(",", "", Amount)), # final numeric
+             Category = trimws(Category)
+      ) %>%
+      slice(-(1:6)) %>% # remove header
+      filter(!is.na(Amount)) %>%
+      mutate(As_of = l.dates0[i])
+  })
+  new_incstmt <- lapply(seq_along(new_cfcdata), function(i) {
+    unlist(new_cfcdata[[i]][["pl"]]) %>%
+      tibble() %>%
+      transmute(n = nchar(.)
+                ,Category = trimws(substr(., 1, 40))
+                # for short lines this can pick up the acct code
+                ,Amount = ifelse(n > 40, trimws(substr(., n-35, n-16)), "")
+                ,Amount = as.numeric(gsub("[,\\$]", "", Amount))
+                # can ignore the last column
+                ,`Previous Yr` = trimws(substr(., n-15, n))
+      ) %>%
+      select(Category, Amount) %>%
+      filter(!is.na(Amount)) %>%
+      mutate(As_of = l.dates[i])
+  })
+  
+} # close new zip file processing
+```
+
+```{r update_with_new_data, include=FALSE}
+UPDATE_RDATA = FALSE
+if (REPLACE_CFC_DATA) {
+  cf.accts <- new_cf.accts
+  ytd.accts <- new_ytd.accts
+  plan.accts <- new_plan.accts
+  rf.accts <- new_rf.accts
+  bs <- new_bs
+  incstmt <- new_incstmt
+  if (!BYPASS_BANK_STMT) {
+  bank_checks <- new_bank_checks
+  bank_balances <- new_bank_balances
+  bank_withdrawals <- new_bank_withdrawals
+  bank_deposits <- new_bank_deposits
+  bank_summary <- new_bank_summary
+  }
+  zips <- all_zips
+  UPDATE_RDATA <- TRUE
+} else if (nrow(missing_zips) >0) {
+  cf.accts <- c(cf.accts, new_cf.accts)
+  ytd.accts <- c(ytd.accts, new_ytd.accts)
+  plan.accts <- c(plan.accts, new_plan.accts)
+  rf.accts <- c(rf.accts, new_rf.accts)
+  bs <- c(bs, new_bs)
+  incstmt <- c(incstmt, new_incstmt)
+  if (!BYPASS_BANK_STMT) {
+  bank_checks <- c(bank_checks, new_bank_checks)
+  bank_balances <- c(bank_balances,new_bank_balances)
+  bank_withdrawals <- c(bank_withdrawals, new_bank_withdrawals)
+  bank_deposits <- c(bank_deposits, new_bank_deposits)
+  bank_summary <- c(bank_summary, new_bank_summary)
+  }
+  # zips <- c(zips, all_zips)
+  zips <- rbind(all_zips, zips)
+  UPDATE_RDATA <- TRUE
+}
+rm(list = ls(pattern = "new_"))
+```
+
+```{r save_data, include=FALSE}
+# all files are processed, save the current state before continuing
+if (file.exists(FN_RDATA)) {
+  file.copy(from = FN_RDATA, to = gsub("Rdata", "bak", FN_RDATA))
+}
+if (UPDATE_RDATA) save(zips, cf.accts, ytd.accts, plan.accts, rf.accts, bs, incstmt, 
+                       bank_checks, bank_balances, bank_withdrawals, bank_deposits, bank_summary,
+     file = FN_RDATA
+)
+```
+
+```{r set_as_of_date, include=FALSE}
+l.dates <- as.yearmon(names(cf.accts))
+# 20240423 added test to allow manual AS_OF assignments to
+# conduct retrospective analyses
+if (!exists("AS_OF")) {
+  AS_OF <- max(l.dates) # yearmon class
+}
+# NOT_JANUARY <- month(AS_OF) >1
+# set working files from AS_OF date
+str_AS_OF <- as.character(AS_OF)
+num_month <- month(AS_OF)
+cf.work <- cf.accts[[str_AS_OF]]
+plan.work <- plan.accts[[str_AS_OF]]
+rf.work <- rf.accts[[str_AS_OF]]
+```
+
+```{r verify_cf, eval=TRUE, include=FALSE, echo=FALSE, warning=FALSE}
+# chunk attributes were eval=FALSE, include=FALSE, echo=FALSE
+# Check TOT EXP and REV of main cash flow sheet
+ck.margins <- cf.work %>%
+  mutate(ck = grepl("TOTAL", Category),
+         TOTCAT = ifelse(ck, Category, NA)) %>%
+  fill(TOTCAT, .direction = "up")
+check1 <- ck.margins %>%
+  filter(!ck & !grepl("YTD", TOTCAT) & !is.na(TOTCAT)) %>%
+  group_by(TOTCAT, Month) %>%
+  summarise(CHECKED = sum(value, na.rm = TRUE)) %>%
+  left_join(select(ck.margins, Category, value, Month), c("TOTCAT"="Category", "Month")) 
+check1
+
+# check the PLAN and ACTUALS columns from the secondary cashflow sheet
+ck.margins <- plan.work %>%
+  filter(Type == "MTD") %>%
+  mutate(ck = grepl("TOTAL", Category),
+         TOTCAT = ifelse(ck, Category, NA)) %>%
+  fill(TOTCAT, .direction = "up")
+check2 <- ck.margins %>%
+  filter(!ck & !grepl("YTD", TOTCAT) & !is.na(TOTCAT)) %>%
+  group_by(TOTCAT, Observation) %>%
+  summarise(CHECKED = sum(value, na.rm = TRUE)) %>%
+  left_join(select(ck.margins, Category, value, Month, Observation), c("TOTCAT"="Category",  "Observation"))
+check2
+
+ok <- check2 %>%
+  ungroup() %>%
+  mutate(ERR = value-CHECKED) %>%
+  summarise(ERR = sum(ERR)) %>%
+  transmute(TEST = ifelse(ERR, "ERROR", "OK"))
+ok
+
+left_join(check2, check1, by = c("TOTCAT", "Month")) %>%
+  filter(Observation == "actual") %>%
+  select(-Observation)
+```
+
+\newpage
+# Reporting finances as of `r TODAY` using data for `r AS_OF`
+
+## <a name="planvact"></a> Plan v. Actuals for ``r as.character(AS_OF)``
+
+```{r plan_v_actuals, echo=FALSE}
+# MONTHLY PLAN V. ACTUALS
+mvp.analysis <- lapply(seq_along(plan.accts), function(i) {
+  # skip this if processing January
+  tmp <- plan.accts[[i]] %>%
+    filter(Type == "MTD") %>%
+    select(-Type, -Actuals) %>%
+    pivot_wider(id_cols = c("Category", "Account", "Month"),
+                values_from = value, values_fn = sum,
+                names_from = Observation) %>%
+    mutate(delta = actual -plan
+           ,perc = (actual /plan -1) *100
+    )
+})
+names(mvp.analysis) <- names(plan.accts)
+mvp.work <- mvp.analysis[[str_AS_OF]]
+```
+
+Top-line current month and YTD
+
+```{r echo=FALSE}
+# fixed this table 20240204, orig. added total categories 20230611
+plan.work %>% 
+  filter(grepl("TOTAL", Category), !grepl("YTD", Category)) %>%
+  mutate(Category = ifelse(Type == "YTD", paste(Category, "YTD"), Category)) %>%
+  select(-Type, -Actuals, -Account, -Month) %>%
+  pivot_wider(id_cols = c("Category"), # "Month"),
+              values_from = value, 
+              names_from = Observation) %>%
+      mutate(delta = actual -plan
+             ,perc = (actual /plan -1) *100
+      ) %>%
+  kbl(digits=2)
+```
+
+"As of" month variances exceeding $`r VARIANCE_LIMIT`
+
+```{r, echo=FALSE, include=TRUE}
+# Repaired this 20230618 by duplicating the YTD analysis below for MTD
+mvp.work %>%
+  filter(!is.na(Account), abs(delta) > VARIANCE_LIMIT) %>%
+  select(-Month) %>%
+  # print(n=100) %>%
+  kbl(digits=2)
+```
+
+<!-- ### <a name="ytd"></a> Year-to-date variances -->
+### Year-to-date variances{#ytd}
+
+YTD variances exceeding a cumulative variance limit to the month
+
+```{r ytd, echo=FALSE}
+ytd.analysis <- lapply(seq_along(plan.accts), function(i) {
+  if (!grepl("Jan", names(plan.accts)[[i]])) {
+    tmp <- plan.accts[[i]] %>%
+      filter(Type == "YTD") %>%
+      select(-Type, -Actuals) %>%
+      pivot_wider(id_cols = c("Category", "Account", "Month"),
+                  values_from = value, values_fn = sum,
+                  names_from = Observation) %>%
+      mutate(delta = actual -plan
+             ,perc = (actual /plan -1) *100
+      )
+  } 
+})
+names(ytd.analysis) <- names(plan.accts)
+ytd.work <- ytd.analysis[[str_AS_OF]]
+
+if (num_month > 1) {
+  filter(ytd.work, abs(delta) > month(Month) *VARIANCE_LIMIT) %>%
+    select(-Month) %>%
+    # print(n=100) %>%
+    kbl(digits=2)
+} else{
+  cat("No YTD reported for January\n")
+}
+```
+
+## <a name="reserves"></a> Reserve Level Test
+
+```{r reserve_level, echo=FALSE, warnings=TRUE}
+# , echo=FALSE, warnings=TRUE
+# added 20 Oct 25 as a sanity check on reserve utilization
+tmp <- 
+  cf.accts %>% 
+  bind_rows %>%
+  filter(grepl("Reserve[[:punct:]]", Category), year(As_of) == year(CURRENT_MONTH)) %>% 
+  filter(As_of == max(As_of), !is.na(value)) %>%
+  mutate(Actual = Month <= As_of)
+# tmp
+
+tmp %>%
+  ggplot(aes(Month, value, group = As_of)) + 
+  stat_interquartilerange(geom = "ribbon",
+                          show.legend = FALSE) +
+  geom_line() + 
+  stat_sparklabels(geom = "label",
+                   show.legend = FALSE) + 
+  scale_colour_manual("", values = c("black", "blue", "red")) + 
+  # scale_y_continuous(limits = c(0, 25)) + 
+  facet_grid(As_of ~ .) +
+  # ggtitle("Daily wind intensity by month in NYC") +
+  labs(title="Reserve Level", y="Balance") +
+  theme_minimal() + 
+  theme(panel.grid = element_blank(),
+        axis.ticks = element_line())
+```
+
+## <a name="eoy"></a> End-of-Year Projections
+
+```{r eoy_projections, echo=FALSE, warnings=FALSE}
+# , include=NOT_JANUARY
+EOWY <- as.yearmon(paste("Dec", year(AS_OF)))
+# eowy_fields <- c("Revenue less Expenses", "Checking account balance", "Total Cash")
+eowy_fields <- c("YTD Ending balance", "Total Cash")
+tmp <- cf.accts %>%
+  bind_rows() %>%
+  filter(Month == EOWY, Category %in% eowy_fields)
+
+# ggplot(tmp, aes(x=As_of, y=value, group=Category)) +
+#   geom_line() +
+#   # facet_grid(scales = "free_y") +
+#   xlab(NULL) + 
+#   theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+tmp %>%
+  pivot_wider(id_cols = "As_of", values_from = "value", names_from = "Category")  %>%
+  arrange(desc(As_of)) %>%
+  kbl(digits=2)
+```
+
+## <a name="rfexp"></a>Restricted funds expended
+
+Restricted funds expended since 2019, without tracking of reimbursable expenses. 
+This is mostly for my curiosity but you may find it interesting, too.
+Dropping reimbursables means
+that actual charges to these funds are higher than indicated, as I have not yet got the
+reimbursable amounts tracked correctly from the worksheet.
+
+```{r restricted_funds, echo=FALSE, warnings=FALSE}
+# MONTHLY RESTRICTED FUNDS CATEGORIES
+# TODO: track reimbursable expenses
+rf.history <- lapply(seq_along(rf.accts), function(i) {
+  rf.accts[[i]] %>%
+    # make substitutions for categories that have changed names over time
+    # not sure if "GP Stewards" was sometimes abbreviated "GPS" or
+    # if that was a totally different project...
+    mutate(Category = ifelse(grepl("Huckleb", Category), "Huckleberry", Category) # trimws() would not drop the trailing space...
+           ,Category = ifelse(grepl("Collaborat", Category), "Collaboratives", Category)
+           ,Category = ifelse(grepl("Aquatic", Category), "Aquatic Restoration", Category)
+           ) %>% 
+    # next line added 15 Oct 22 to capture reimbursements
+    group_by(Category, As_of) %>% #, Reimbursable) %>% 
+    # next line prevents unhelpful reminders that we grouped on two variables
+    suppressWarnings(summarize(Expenses = sum(Expense, na.rm = TRUE)
+                               ,Revenue = sum(Revenue, na.rm = TRUE))
+                     ) %>%
+    ungroup %>%
+    mutate(Date = as.Date(As_of)
+           ,Month = month(As_of)
+           ,Year = year(As_of)
+           ) %>%
+    # other cleanup is required to handle changing formats in RF sheet
+    # using a select function allows us to drop columns that may not
+    # exist in every table...
+    dplyr::select(-any_of("Fund receipt date"), -starts_with("X"))
+}) %>%
+  bind_rows
+
+# added 3 Feb 2024 to capture trends in restricted fund revs
+rf.history %>%
+  group_by(Year) %>%
+  summarize(Expenses = sum(Expense, na.rm = TRUE)
+            ,Revenue = sum(Revenue, na.rm = TRUE)) %>%
+  mutate(`Exp GR%` = round((1 - lag(Expenses, 1)/Expenses) *100, 2)
+         ,`Rev GR%` = round((1 - lag(Revenue, 1)/Revenue) *100, 2)
+  ) %>%
+  arrange(desc(Year)) %>%
+  kbl(digits=2)
+
+rf.history %>%
+  ggplot(aes(x=Month, y=Expense, fill=Category)) +
+  geom_bar(stat="identity") +
+  labs(y="Charges ($)", title="Charges to Restricted Funds by Month", fill="Project") +
+  # scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+  scale_x_continuous(breaks = 1:12, labels = base::month.abb) +
+  scale_fill_viridis(discrete = TRUE) +
+  facet_wrap(~ Year) +
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+rf.history %>%
+  filter(Year == year(AS_OF)) %>%
+  mutate(Category = ifelse(Reimbursable, paste(Category, "(R)"), Category)) %>%
+  ggplot(aes(x=Date, y=Expense, fill=Category)) +
+  geom_bar(stat="identity") +
+  labs(y="Charges ($)", title=sprintf("Charges to Restricted Funds by Month for %d", year(AS_OF)), fill="Project", caption = "(R) = Reimbursement") +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+  scale_fill_viridis(discrete = TRUE) +
+  facet_wrap(~ Year)
+
+rf.history %>%
+  filter(Year == year(AS_OF)) %>%
+  mutate(Category = ifelse(Reimbursable, paste(Category, "(R)"), Category)) %>%
+  ggplot(aes(x=Date, y=Revenue, fill=Category)) +
+  geom_bar(stat="identity") +
+  labs(y="Revenue ($)", title=sprintf("Revenues from Restricted Funds by Month for %d", year(AS_OF)), fill="Project", caption = "(R) = Reimbursement") +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+  scale_fill_viridis(discrete = TRUE) +
+  facet_wrap(~ Year)
+```
+
+The summary plot is hard to read because there are so many different projects (funds)
+we have set up internally over the past few years, and the color gradations are hard
+to read. The current year profile is much easier on the eyes.
+
+## <a name="newrf"></a>Restricted Fund Revenues
+
+```{r new_rf, echo=FALSE}
+rf.history %>% 
+  filter(As_of == AS_OF) %>%
+  group_by(Category, Reimbursable) %>%
+  summarize(`New Revenue` = sum(Revenue, na.rm=TRUE)) %>%
+  rename(Reimbursment = Reimbursable) %>%
+  filter(`New Revenue` >0) %>%
+  kbl(digits=2)
+```
+
+### Restricted Fund Revenue-Expense Verification
+
+These are for comparison with the bottom line values from the restricted funds worksheets
+
+```{r, echo=FALSE}
+lapply(seq_along(rf.accts), function (i) {
+  mo <- as.yearmon(names(rf.accts)[i])
+  rf.accts[[i]] %>% 
+    summarise(As_of = mo
+              ,`Balance Prev` = sum(`End Balance Prev`, na.rm = TRUE)
+              ,Revenue = sum(Revenue, na.rm = TRUE)
+              ,Expenses = sum(Expense, na.rm = TRUE)
+              ,Balance = sum(`End Balance`, na.rm = TRUE))
+}) %>%
+  bind_rows %>%
+  arrange(rev(As_of))
+```
+
+## <a name="metrics"></a>Metrics (draft)
+
+### Liquidity measures (draft)
+
+```{r liquidity_measures, echo=FALSE}
+# MONTHLY METRICS
+mofin <- left_join(
+  bind_rows(bs) %>%
+    filter(Category != "Page") %>%
+    mutate(Category = gsub("· ", "", Category)) %>%
+    mutate(Category = gsub("Total 3100", "3100", Category)) %>%
+    pivot_wider(id_cols = "As_of", names_from = "Category", values_from = "Amount",
+                values_fn = sum)
+  ,bind_rows(incstmt) %>%
+    mutate(Category = gsub("· ", "", Category)) %>%
+    pivot_wider(id_cols = "As_of", names_from = "Category", values_from = "Amount")
+  ,by="As_of"
+) %>%
+  mutate(across(where(is.numeric), function(x) replace_na(x, 0) )) %>%
+  rename(TotCurrASSETS = `Total Current Assets`, TotCurrLIAB = `Total Current Liabilities`,
+         TempRestricted = `3100 Temp. Restricted Net Assets`,
+         TotExpenses = `Total Expenses`, TotalChecking = `1010 Beneficial Checking`) %>%
+  mutate(Cash = TotalChecking,
+         TotalReserves = `1071 Edward Jones` + `1072 Fidelity`,
+         MA_Checking = rollmean(TotalChecking, k=12, fill=NA, align = "right"), # 12 mo moving avg
+         MA_Expenses = rollmean(TotExpenses, k=12, fill=NA, align = "right")
+         )
+
+out <- mofin %>%
+        mutate(`Mos. Spending` = round((TotCurrASSETS - TotCurrLIAB + TempRestricted) / MA_Expenses, 1),
+               `Reserve Test` = TotalReserves /MA_Expenses) %>%
+        select(As_of, `Mos. Spending`, `Reserve Test`, `Exp MMA` = MA_Expenses, 
+               `Total Reserves` =  TotalReserves,
+               TotCurrASSETS, TotCurrLIAB, TempRestricted, TotExpenses) %>%
+        arrange(desc(As_of))
+
+# report last 12 mos.
+head(out, n=12) %>% 
+  rbind(slice(out, with(out, c(which.min(`Mos. Spending`), which.max(`Mos. Spending`))))
+        ) %>%
+  arrange(desc(As_of)) %>%
+  distinct() %>%
+  kbl(digits=2, booktabs = T) %>%
+  kable_paper(full_width = F, font_size = 7)
+```
+
+### Revenue measures (draft)
+
+```{r revenue_measures, echo=FALSE, warning=FALSE}
+eoyrev <- lapply(ytd.accts, function(x) {
+  eoy <- x %>%
+    mutate(Account = as.numeric(as.character(Account))) %>%
+    filter(month(Month) == 12, Account <5000) %>%
+    filter(!Category %in% c("Individual Donations", "Grants")) %>%
+    mutate(Category = gsub("Annual - one time gifts", "OTG", Category)
+           ,Category = gsub("Monthly - recurring gifts", "Recurring Gifts", Category)
+           ,Category = gsub("Online one time gifts", "Online OTG", Category)
+    )
+  revtot <- pull(eoy, value) %>% sum()
+  eoy %>%
+    mutate(EOY = revtot)
+}) %>%
+  bind_rows %>%
+  mutate(f = value /EOY # source of NAs
+         ,Year = year(Month))
+
+eoyrev %>%
+  ggplot(aes(x=Category, y=value, fill=Category, group=Year)) +
+  geom_bar(stat="identity", show.legend = FALSE) +
+  facet_wrap(~ Year) +
+  labs(y="Revenue ($)", title="EOY Revenue by Category") +
+  scale_fill_viridis(discrete = TRUE) +
+  theme(axis.text.x = element_text(angle = 45, hjust=1))
+
+cat("YoY change in revenue category as a percentage\n")
+eoyrev %>%
+  mutate(Year = as.factor(Year)) %>%
+  pivot_wider(id_cols = Year, names_from = Category) %>%
+  replace_na(list("Online OTG" = 0)) %>%
+  mutate(across(is.numeric, function(x) (x/lag(x, 1) -1) *100)) %>%
+  t %>%
+  data.frame %>%
+  set_names(., slice(., 1)) %>%
+  rownames_to_column("Category") %>%
+  slice(-1) %>%
+  tibble %>%
+  mutate(across(starts_with("2"), function(x) as.numeric(x))) %>%
+  kbl(digits=2)
+
+cat("Percentage of annual revenue by category\n")
+eoyrev %>%
+  mutate(perc = f *100) %>%
+  pivot_wider(id_cols = Category, names_from = Year, values_from = perc) %>%
+  kbl()
+```
+
+## <a name="yoy"></a>Year-over-Year at YTD
+
+```{r yoy, echo=FALSE}
+# Using cumulative YoY (YTD) find the percentage change in each account 
+# code over successive years
+yoy.wide <- 
+  lapply(seq_along(ytd.accts), function(i) {
+    if (month(as.yearmon(names(ytd.accts))[i]) == month(AS_OF)) 
+      out <- ytd.accts[[i]]
+    else out <- NULL
+    out
+  }) %>%
+  bind_rows %>%
+  mutate(Year = year(Month)) %>%
+  # filter(!is.na(Account)) %>%
+  mutate(Account = paste(Account, Category, sep="~")) %>%
+  group_by(Account, Year) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  ungroup %>%
+  arrange(Account) %>%
+  pivot_wider(id_cols = Year, names_from = Account, values_from = value) %>%
+  arrange(Year) %>%
+  mutate(across(!starts_with("Year"), function(x) (x /lag(x, 1) -1) *100))
+yrs <- as.character(pull(yoy.wide, 1))
+
+# using YTD, show percentage changes over previous n years
+yoy.long <- yoy.wide %>%
+  t %>%
+  data.frame %>%
+  rownames_to_column() %>%
+  rename_all(~ c("Account", yrs)) %>%
+  slice(-1) %>%
+  tibble %>%
+  mutate(Category = gsub("[0-9]+.*\\~(.*)", "\\1", Account)
+         ,Account = gsub("([0-9]+.*)\\~.*", "\\1", Account)
+  ) %>%
+  select(Account, Category, all_of(yrs)) %>%
+  mutate(across(all_of(yrs), function(x) as.numeric(x))) %>%
+  # remove rows if no doubles are finite
+  filter(if_any(where(is.double), ~ is.finite(.))) %>%
+  select(where(~!all(is.na(.x))))
+
+# report in totals only
+# print(filter(yoy.long, grepl("^NA\\~", Account)) %>%
+#         select(-Account) %>%
+#         filter(!is.na(Category)) %>%
+#         mutate(Category = gsub("NA\\~", "", Category))
+#         , n=100)
+filter(yoy.long, grepl("^NA\\~", Account)) %>%
+        select(-Account) %>%
+        filter(!is.na(Category)) %>%
+        mutate(Category = gsub("NA\\~", "", Category)) %>%
+  kbl(digits=2)
+
+# report in all account codes
+# print(filter(yoy.long, !grepl("^NA\\~", Account)), n=100)
+filter(yoy.long, !grepl("^NA\\~", Account)) %>% kbl()
+
+# highlight changes YoY exceeding tolerance
+this.yr <- rev(yrs)[1]
+last.yr <- as.character(as.integer(this.yr) -1)
+
+yoy.long %>%
+  filter((abs(!!sym(this.yr)) >= YOY_PERC_TOL & is.finite(!!sym(this.yr))) |
+  (abs(!!sym(last.yr)) >= YOY_PERC_TOL & is.finite(!!sym(last.yr)))) %>%
+  kbl(digits=2)
+```
+
+\newpage
+### <a name="notes"></a>Notes
+
+To do:
+
+Beneficial bank statement processing stopped working in Sept 2024 with a change of statement format.
+
+<!-- These report sections are no longer working as intended (Mar 2024) -->
+<!-- plan_v_actuals  -->
+<!-- multi-year restricted funds chart looks weird for 2024 so far -->
+
+<!-- Develop better tracking of reimbursable expenses, currently not accounted for in -->
+<!-- restricted funds expenses. -->
+
+<!-- Exclude more of the code, leaving just plots, tables and discussion. -->
+
+<!-- Extract current EOY tracking, examine up and down. -->
+
+<!-- Create "Treasurer's Prerogative" metrics for identifying opportunities at EOY to -->
+<!-- transfer funds to reserves if not otherwise committed for operations and programs. -->
+
+Add additional metrics. I have a draft for "Months of Spending" but am not yet happy with the assumptions. I will probably standardize on a moving 1, 2 or 4 quarter average for things like expenses. There are plenty of lists out there of metrics for non-profit financial monitoring. Examples with plenty of overlaps:
+
+https://www.barnesdennig.com/measuring-nonprofit-financial-performance/
+
+https://www.cpajournal.com/2019/06/05/using-ratio-analysis-to-manage-not-for-profit-organizations/
+
+https://donorbox.org/nonprofit-blog/kpis-for-your-nonprofit/
+
+_If used correctly metrics like those mentioned in the links can act as both early warning indicators for Molly and Boardmembers, and a way to view the org. in the same light as a prospective donor might having performed some basic diligence._ 
+<!-- I do not think we can use all (or even most) of the metrics in the links, and some are less relevant for how we operate than others. But, I hope to find applications to complement our strategic plan going forward. I *do not advocate* that we should try "tuning" operations to change any measures we might adopt for tracking purposes and would consider doing so a mistake. -->
+
+TO DO:
+
+* create a restricted funds revenues grid chart for history
+
+* maintain and better report on changing EOY expectations for current year
+
+## <a name="chglog"></a>Change Log
+
+Oct 16, 2022: Modified the Restricted Funds worksheet processing to 1) repair an
+error that omitted some Grantors for which no Category was associated; 2) better
+capture reimbursable expenses and reimbursements; produced a table for
+RF to verify the sheets have been processed correctly.
+
+Feb 20, 2023: Added YoY reporting using cumulative revenue and expenses to month
+(i.e. YTD). Added draft of historic revenue breakout measures as proportion of 
+annual total.
+
+Sep 15, 2023: Now tracking changes to EOY net revenue and total cash projections
+throughout the fiscal year. This may help judge targets for the next year's 
+plan.
+
+Feb 3, 2024: Added tabulation of Restricted Funds revenue and expensed totals by
+year with their respective annual growth rates as percentages
+
+Mar 16, 2024: MTD variances now tested when working month is January. The correction appears in plan_v_actuals. We can probably eliminate the NOT_JANUARY flag in the future.
+
+Apr 21, 2024: Plan v. Actuals reporting has been broken since the beginning of the year because of some changes to the "2nd tab" formatting in the cashflow worksheet. Corrected this by eliminating all spacing columns and updating the column position labels. Also dropped extraneous rows in the table.
+
+Apr 23, 2024: Restricted funds tables are now parsed more flexibly to account for changes in table format over time. Column names are now assigned from within the table instead of hard-recodes.
+
+May 11, 2024: Sped up processing by saving the long-form data tables we currently rebuild with each run, check the `as of` dates, read only new data if they exist, update the long tables. save the updated tables only if they changed and only at the very end of reporting. this will prevent corruption of previously saved data and speed up every subsequent run. we can always rebuild from scratch by deleting the saved long-form data.
+
+May 11, 2024: Fixed the EOY tabulation for net revenue and removed the plot of same.
+
+May 24, 2024: Lingering problems with setwd() when the markdown source is somewhere other than the desired path. Current solution is to run the report in the "Finance" and move the Rmd and PDF to the correct board  reporting folder afterward. Blah.
+
+Oct 30, 2025: Added a reserve level sparkline to catch short term transfers that span a single month. Plot uses only the current months instance of the cashflow. This plot required some edits to the cashflow parsing to ensure Reserves were correctly parsed from the worksheet, using column B as a failover label when column C was undefined.
+
+```{r appendix, eval=FALSE, include=FALSE}
+# testing out how to get a moving estimate of total expenses
+# for comparison with our reserves (reserves testing, and res. available 
+# for development...)
+
+# this uses the current year's plan and actual expenses (to as of date)
+# to get a 3 month expense level to three sig figs.
+cy.exp <- filter(cf.work, Category=="TOTAL EXPENSE", !is.na(Month)) %>%
+  pull(value) %>%
+  sum()
+
+threemo.exp <- signif(cy.exp /12 *3, 3)
+
+
+zips
+
+```
+
+```{r end}
+sessionInfo()
+```
